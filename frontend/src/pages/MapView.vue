@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, onUnmounted, watch, computed } from 'vue'
+import { ref, reactive, onMounted, onUnmounted, watch, computed } from 'vue'
 import maplibregl from 'maplibre-gl'
 import 'maplibre-gl/dist/maplibre-gl.css'
 
@@ -16,6 +16,7 @@ import {
 const mapContainer = ref(null)
 let map = null
 let popup = null
+let addMarker = null   // временный маркер новой точки
 
 const layers = ref({ fires: true, danger: true, districts: false })
 const filters = ref({
@@ -26,6 +27,31 @@ const filters = ref({
 const timeRange = ref(null)  // {from, to} — от слайдера
 const loading = ref(false)
 const firesData = ref({ type: 'FeatureCollection', features: [] })
+
+// --- Состояние режима добавления пожара ---
+const addMode = ref(false)
+const saving = ref(false)
+const saveError = ref('')
+
+function defaultForm() {
+  const now = new Date()
+  const pad = (n) => String(n).padStart(2, '0')
+  const local =
+    `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}` +
+    `T${pad(now.getHours())}:${pad(now.getMinutes())}`
+  return {
+    category: 'forest',
+    occurred_at: local,
+    settlement: '',
+    area_hectares: '',
+    fatalities_count: 0,
+    commander: '',
+    cause_raw: '',
+    lat: null,
+    lng: null,
+  }
+}
+const form = reactive(defaultForm())
 
 // Слайдер работает в пределах текущего фильтра date_from..date_to
 const sliderMin = computed(() => new Date(filters.value.date_from))
@@ -73,10 +99,15 @@ onMounted(() => {
     await Promise.all([loadDistricts(), loadDanger(), loadFires()])
     applyLayerVisibility()
     bindInteractions()
+    // общий клик по карте — для режима добавления
+    map.on('click', handleAddClick)
   })
 })
 
-onUnmounted(() => map && map.remove())
+onUnmounted(() => {
+  if (addMarker) addMarker.remove()
+  if (map) map.remove()
+})
 
 // --- Добавление источников и слоёв ---
 function addSourcesAndLayers() {
@@ -259,6 +290,7 @@ function applyLayerVisibility() {
 function bindInteractions() {
   // Клик по кластеру — зумимся внутрь
   map.on('click', 'fires-clusters', (e) => {
+    if (addMode.value) return
     const feature = e.features[0]
     const clusterId = feature.properties.cluster_id
     map.getSource('fires').getClusterExpansionZoom(clusterId, (err, zoom) => {
@@ -269,6 +301,7 @@ function bindInteractions() {
 
   // Наведение на кластер — тултип
   map.on('mouseenter', 'fires-clusters', (e) => {
+    if (addMode.value) return
     map.getCanvas().style.cursor = 'pointer'
     const p = e.features[0].properties
     popup.setLngLat(e.lngLat).setHTML(`
@@ -281,12 +314,14 @@ function bindInteractions() {
     `).addTo(map)
   })
   map.on('mouseleave', 'fires-clusters', () => {
+    if (addMode.value) return
     map.getCanvas().style.cursor = ''
     popup.remove()
   })
 
   // Клик по точке — карточка
   map.on('click', 'fires-point', (e) => {
+    if (addMode.value) return
     const f = e.features[0]
     const p = f.properties
     popup.setLngLat(f.geometry.coordinates).setHTML(`
@@ -303,11 +338,12 @@ function bindInteractions() {
       </div>
     `).addTo(map)
   })
-  map.on('mouseenter', 'fires-point', () => map.getCanvas().style.cursor = 'pointer')
-  map.on('mouseleave', 'fires-point', () => map.getCanvas().style.cursor = '')
+  map.on('mouseenter', 'fires-point', () => { if (!addMode.value) map.getCanvas().style.cursor = 'pointer' })
+  map.on('mouseleave', 'fires-point', () => { if (!addMode.value) map.getCanvas().style.cursor = '' })
 
   // Клик по полигону опасности — показать класс
   map.on('click', 'danger-fill', (e) => {
+    if (addMode.value) return
     const p = e.features[0].properties
     const cls = p.danger_class
     popup.setLngLat(e.lngLat).setHTML(`
@@ -322,6 +358,79 @@ function bindInteractions() {
   })
 }
 
+// --- Режим добавления пожара ---
+function startAdd() {
+  saveError.value = ''
+  Object.assign(form, defaultForm())
+  addMode.value = true
+  popup.remove()
+}
+
+function cancelAdd() {
+  addMode.value = false
+  saveError.value = ''
+  if (addMarker) { addMarker.remove(); addMarker = null }
+}
+
+// Клик по карте в режиме добавления — ставим/двигаем маркер
+function handleAddClick(e) {
+  if (!addMode.value) return
+  setPoint(e.lngLat.lng, e.lngLat.lat)
+}
+
+function setPoint(lng, lat) {
+  form.lng = lng
+  form.lat = lat
+  if (!addMarker) {
+    addMarker = new maplibregl.Marker({ color: '#d32f2f', draggable: true })
+      .setLngLat([lng, lat])
+      .addTo(map)
+    addMarker.on('dragend', () => {
+      const ll = addMarker.getLngLat()
+      form.lng = ll.lng
+      form.lat = ll.lat
+    })
+  } else {
+    addMarker.setLngLat([lng, lat])
+  }
+}
+
+async function submitNewFire() {
+  if (form.lat == null || form.lng == null) {
+    saveError.value = 'Сначала поставьте точку на карте.'
+    return
+  }
+  saving.value = true
+  saveError.value = ''
+  try {
+    const r = await fetch('/api/fires/create/', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        lat: form.lat,
+        lng: form.lng,
+        category: form.category,
+        occurred_at: form.occurred_at,
+        settlement: form.settlement,
+        area_hectares: form.area_hectares === '' ? 0 : form.area_hectares,
+        fatalities_count: form.fatalities_count === '' ? 0 : form.fatalities_count,
+        commander: form.commander,
+        cause_raw: form.cause_raw,
+      }),
+    })
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}))
+      throw new Error(err.detail || `Ошибка ${r.status}`)
+    }
+    await loadFires()   // обновляем слой, чтобы новая точка появилась
+    cancelAdd()
+  } catch (e) {
+    saveError.value = e.message || 'Не удалось сохранить'
+  } finally {
+    saving.value = false
+  }
+}
+
 function emptyFC() { return { type: 'FeatureCollection', features: [] } }
 
 // --- Реакции на изменение состояния ---
@@ -331,6 +440,9 @@ watch(filters, async () => {
   await loadDanger()
 }, { deep: true })
 watch(timeRange, applyTimeFilter, { deep: true })
+watch(addMode, (on) => {
+  if (map) map.getCanvas().style.cursor = on ? 'crosshair' : ''
+})
 </script>
 
 <template>
@@ -356,12 +468,172 @@ watch(timeRange, applyTimeFilter, { deep: true })
       :max="sliderMax"
       @change="timeRange = $event"
     />
+
+    <!-- Кнопка включения режима добавления -->
+    <button
+      v-if="!addMode"
+      class="add-fire-btn"
+      @click="startAdd"
+    >＋ Добавить пожар</button>
+
+    <!-- Панель ввода данных нового пожара -->
+    <div v-if="addMode" class="add-panel">
+      <div class="add-panel__head">
+        <b>Новый пожар</b>
+        <button class="x" @click="cancelAdd" title="Отмена">✕</button>
+      </div>
+
+      <p class="hint" v-if="form.lat == null">
+        Кликните по карте, чтобы поставить точку.
+      </p>
+      <p class="coords" v-else>
+        Координаты: {{ form.lat.toFixed(5) }}, {{ form.lng.toFixed(5) }}
+        <span class="muted">(маркер можно перетащить)</span>
+      </p>
+
+      <label>Категория
+        <select v-model="form.category">
+          <option value="forest">Лесной</option>
+          <option value="techno">Техносферный</option>
+        </select>
+      </label>
+
+      <label>Дата и время
+        <input type="datetime-local" v-model="form.occurred_at">
+      </label>
+
+      <label>Населённый пункт
+        <input type="text" v-model="form.settlement" placeholder="необязательно">
+      </label>
+
+      <div class="two">
+        <label>Площадь, га
+          <input type="number" min="0" step="0.1" v-model="form.area_hectares" placeholder="0">
+        </label>
+        <label>Погибших
+          <input type="number" min="0" step="1" v-model="form.fatalities_count">
+        </label>
+      </div>
+
+      <label>Руководитель тушения
+        <input type="text" v-model="form.commander" placeholder="необязательно">
+      </label>
+
+      <label>Причина (текст)
+        <textarea rows="2" v-model="form.cause_raw" placeholder="необязательно"></textarea>
+      </label>
+
+      <p class="err" v-if="saveError">{{ saveError }}</p>
+
+      <div class="actions">
+        <button class="cancel" @click="cancelAdd" :disabled="saving">Отмена</button>
+        <button class="save" @click="submitNewFire" :disabled="saving || form.lat == null">
+          {{ saving ? 'Сохранение…' : 'Сохранить' }}
+        </button>
+      </div>
+    </div>
   </div>
 </template>
 
 <style scoped>
 .map-view { position: relative; width: 100%; height: 100vh; }
 .map { position: absolute; inset: 0; }
+
+.add-fire-btn {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 5;
+  background: #d32f2f;
+  color: #fff;
+  border: none;
+  border-radius: 20px;
+  padding: 8px 18px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+}
+.add-fire-btn:hover { background: #b71c1c; }
+
+.add-panel {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 6;
+  width: 320px;
+  max-width: calc(100vw - 24px);
+  background: #fff;
+  border-radius: 10px;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+  padding: 14px 16px;
+  font-size: 13px;
+  color: #263238;
+}
+.add-panel__head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+  font-size: 15px;
+}
+.add-panel__head .x {
+  border: none;
+  background: none;
+  font-size: 16px;
+  cursor: pointer;
+  color: #90a4ae;
+  line-height: 1;
+}
+.add-panel label {
+  display: block;
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: #607d8b;
+}
+.add-panel input,
+.add-panel select,
+.add-panel textarea {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  margin-top: 3px;
+  padding: 6px 8px;
+  border: 1px solid #cfd8dc;
+  border-radius: 6px;
+  font-size: 13px;
+  color: #263238;
+}
+.add-panel .two { display: flex; gap: 10px; }
+.add-panel .two label { flex: 1; }
+.add-panel .hint { color: #d32f2f; margin: 4px 0; }
+.add-panel .coords { margin: 4px 0; font-size: 12px; }
+.add-panel .coords .muted { color: #90a4ae; }
+.add-panel .err {
+  color: #c62828;
+  background: #ffebee;
+  border-radius: 6px;
+  padding: 6px 8px;
+  margin: 10px 0 0;
+}
+.add-panel .actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 14px;
+}
+.add-panel .actions button {
+  border: none;
+  border-radius: 6px;
+  padding: 8px 14px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.add-panel .actions .cancel { background: #eceff1; color: #455a64; }
+.add-panel .actions .save { background: #2e7d32; color: #fff; font-weight: 600; }
+.add-panel .actions .save:disabled { background: #a5d6a7; cursor: default; }
 </style>
 
 <style>
